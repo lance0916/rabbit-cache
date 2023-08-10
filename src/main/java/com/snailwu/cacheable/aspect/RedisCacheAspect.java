@@ -10,6 +10,15 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.snailwu.cacheable.annotation.CacheEvict;
 import com.snailwu.cacheable.annotation.Cacheable;
+import java.io.IOException;
+import java.lang.reflect.Method;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.text.SimpleDateFormat;
+import java.time.Duration;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import javax.annotation.Resource;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
@@ -30,16 +39,6 @@ import org.springframework.expression.spel.support.StandardEvaluationContext;
 import org.springframework.lang.NonNull;
 import org.springframework.stereotype.Component;
 
-import javax.annotation.Resource;
-import java.io.IOException;
-import java.lang.reflect.Method;
-import java.lang.reflect.ParameterizedType;
-import java.lang.reflect.Type;
-import java.text.SimpleDateFormat;
-import java.time.Duration;
-import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.TimeUnit;
-
 /**
  * @author WuQinglong
  */
@@ -51,23 +50,30 @@ public class RedisCacheAspect implements ApplicationContextAware {
     private final Logger log = LoggerFactory.getLogger(RedisCacheAspect.class);
 
     public final ObjectMapper jackson = new ObjectMapper()
-            .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
-            .setDateFormat(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"))
-            .setSerializationInclusion(JsonInclude.Include.NON_NULL);
+        .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+        .setDateFormat(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"))
+        .setSerializationInclusion(JsonInclude.Include.NON_NULL);
 
     private final SpelExpressionParser parser = new SpelExpressionParser();
     private final LocalVariableTableParameterNameDiscoverer discoverer = new LocalVariableTableParameterNameDiscoverer();
 
     private ApplicationContext applicationContext;
 
+    /**
+     * 一级缓存，本地缓存
+     * FIXME 不同的缓存有不同的配置
+     */
     private Cache<String, Object> loadingCache = Caffeine.newBuilder()
-            .maximumSize(100)
-            .expireAfterAccess(Duration.ofSeconds(10))
-            .build();
+        .maximumSize(100)
+        .expireAfterAccess(Duration.ofSeconds(10))
+        .build();
 
     @Resource
     private RedissonClient redissonClient;
 
+    /**
+     * 缓存切面不应该影响业务，所以这里不抛出异常
+     */
     @Around("@annotation(com.snailwu.cacheable.annotation.Cacheable)")
     public Object cachePut(ProceedingJoinPoint joinPoint) throws Throwable {
         MethodSignature signature = (MethodSignature) joinPoint.getSignature();
@@ -84,7 +90,7 @@ public class RedisCacheAspect implements ApplicationContextAware {
         // 本地缓存有，直接返回
         Object localCacheResult = loadingCache.getIfPresent(key);
         if (localCacheResult != null) {
-            log.info("从本地缓存中获取到数据，返回");
+            log.debug("从本地缓存中获取到数据，返回");
             return localCacheResult;
         }
 
@@ -92,12 +98,12 @@ public class RedisCacheAspect implements ApplicationContextAware {
         String dataJson = (String) redissonClient.getBucket(key, new StringCodec()).get();
         if (dataJson != null && !dataJson.isEmpty()) {
             JavaType javaType = getJavaType(method.getGenericReturnType());
+            // FIXME readJson不应该抛异常，而是返回空值，然后去数据库中进行查询，再重新放入缓存中
             Object result = readJson(dataJson, javaType);
 
             // 放入本地缓存
             loadingCache.put(key, result);
-
-            log.info("从 Redis 缓存中获取到数据，并更新到本地缓存");
+            log.debug("从 Redis 缓存中获取到数据，并更新到本地缓存");
 
             return result;
         }
@@ -107,8 +113,9 @@ public class RedisCacheAspect implements ApplicationContextAware {
         if (!lock.tryLock(cacheable.methodTimeout(), TimeUnit.MILLISECONDS)) {
             throw new RuntimeException("获取分布式锁异常");
         }
+
         try {
-            // 尝试获取本地缓存的值
+            // 再次尝试获取本地缓存的值
             localCacheResult = loadingCache.getIfPresent(key);
             if (localCacheResult != null) {
                 return localCacheResult;
@@ -116,6 +123,8 @@ public class RedisCacheAspect implements ApplicationContextAware {
 
             // 执行方法逻辑，获取要缓存的数据
             Object result = joinPoint.proceed();
+
+            // 如果返回值为 null，则不缓存
             if (result == null) {
                 return null;
             }
